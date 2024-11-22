@@ -1,2 +1,10 @@
 streamlit
 openai
+pandas
+openai
+tqdm
+weaviate
+weaviate-client
+langchain_openai
+numpy
+langchain

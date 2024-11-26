@@ -8,3 +8,6 @@ weaviate-client
 langchain_openai
 numpy
 langchain
+bs4
+langchain_community
+lxml

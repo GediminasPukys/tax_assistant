@@ -12,6 +12,9 @@ import weaviate.classes as wvc
 from pydantic import BaseModel, Field
 import pandas as pd
 
+wcd_url = st.secrets["weaviate_credentials"]["url"]
+weaviate_token = st.secrets["weaviate_credentials"]["token"]
+openai_api_key = st.secrets["openai_credentials"]["api_key"]
 
 class LegalDocumentEvaluation(BaseModel):
     """Evaluation of retrieved legal documents"""
@@ -46,11 +49,10 @@ def init_session_state():
 
 
 def setup_weaviate_client():
-    wcd_url = 'https://xh1j9trzu5cervreztxw.c0.europe-west3.gcp.weaviate.cloud'
     return weaviate.connect_to_weaviate_cloud(
         cluster_url=wcd_url,
-        auth_credentials=Auth.api_key('uTTyayyrfwyn98zBq6ukAcIAVnEJjkBWMLac'),
-        headers={"X-OpenAI-Api-Key": os.getenv("OPENAI_API_KEY")}
+        auth_credentials=Auth.api_key(weaviate_token),
+        headers={"X-OpenAI-Api-Key": openai_api_key}
     )
 
 
@@ -281,7 +283,7 @@ def main():
 
     try:
         client = setup_weaviate_client()
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
+        llm = ChatOpenAI(model="gpt-4o", temperature=0.1, api_key=openai_api_key)
     except Exception as e:
         st.error("Klaida jungiantis prie dokumentų duomenų bazės")
         return

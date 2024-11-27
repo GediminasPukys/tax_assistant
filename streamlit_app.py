@@ -10,25 +10,22 @@ from langchain.prompts import ChatPromptTemplate
 from langchain.output_parsers import CommaSeparatedListOutputParser
 import weaviate.classes as wvc
 from pydantic import BaseModel, Field
+import pandas as pd
 
 
 class LegalDocumentEvaluation(BaseModel):
     """Evaluation of retrieved legal documents"""
-
     relevance_explanation: str = Field(
         description="Explanation of how the documents answer the query"
     )
-
     cited_articles: List[str] = Field(
         description="List of relevant article citations",
         min_length=1
     )
-
     missing_information: List[str] = Field(
         description="Information that would help provide a more accurate answer",
         default=[]
     )
-
     time_period_note: str = Field(
         description="Note about the time period relevance of the answer",
         default=""
@@ -44,6 +41,8 @@ def init_session_state():
             memory_key="chat_history",
             input_key="input"
         )
+    if "query_date" not in st.session_state:
+        st.session_state.query_date = datetime.now()
 
 
 def setup_weaviate_client():
@@ -56,27 +55,67 @@ def setup_weaviate_client():
 
 
 def extract_date_from_query(query: str, llm: ChatOpenAI) -> datetime:
-    """Extract date from query using LLM"""
-    template = """Extract the relevant date from the user's legal query.
-    If no specific date is mentioned, determine if the query implies a historical or current context.
+    """Extract date from query using LLM if no date is set in session"""
+    if "query_date" not in st.session_state:
+        template = """Extract the relevant date from the user's legal query.
+        If no specific date is mentioned, determine if the query implies a historical or current context.
 
-    User Query: {query}
+        User Query: {query}
 
-    Rules:
-    1. If a specific date is mentioned, return it in YYYY-MM-DD format
-    2. If no date is mentioned but historical context is implied, estimate the relevant period
-    3. If no temporal context is given, return today's date
-    4. Always return a single date in YYYY-MM-DD format
+        Rules:
+        1. If a specific date is mentioned, return it in YYYY-MM-DD format
+        2. If no date is mentioned but historical context is implied, estimate the relevant period
+        3. If no temporal context is given, return today's date
+        4. Always return a single date in YYYY-MM-DD format
 
-    Return ONLY the date in YYYY-MM-DD format, nothing else."""
+        Return ONLY the date in YYYY-MM-DD format, nothing else."""
 
-    prompt = ChatPromptTemplate.from_template(template)
-    result = llm.invoke(prompt.format(query=query))
+        prompt = ChatPromptTemplate.from_template(template)
+        result = llm.invoke(prompt.format(query=query))
 
+        try:
+            st.session_state.query_date = datetime.strptime(result.content.strip(), '%Y-%m-%d')
+        except:
+            st.session_state.query_date = datetime.now()
+
+    return st.session_state.query_date
+
+
+def get_full_article(client, article_number: str, valid_from: str, valid_to: str) -> List:
+    """Retrieve full article content by article number and validity period"""
     try:
-        return datetime.strptime(result.content.strip(), '%Y-%m-%d')
-    except:
-        return datetime.now()
+        collection = client.collections.get("Vmi_docs")
+
+        # Create filter for exact article match
+        filter_article = wvc.query.Filter.by_property("article_number").equal(article_number)
+        filter_date = (
+                wvc.query.Filter.by_property("valid_from").equal(valid_from) &
+                wvc.query.Filter.by_property("valid_to").equal(valid_to)
+        )
+        combined_filter = filter_article & filter_date
+
+        # Execute query
+        query_result = collection.query.fetch_objects(
+            return_properties=[
+                "article_number",
+                "article_content",
+                "article_title",
+                "chapter_title",
+                "valid_from",
+                "valid_to",
+                "name",
+                "doc_link"
+            ],
+            filters=combined_filter,
+        )
+
+        if query_result.objects:
+            return [obj.properties for obj in query_result.objects]
+        return []
+
+    except Exception as e:
+        print(f"Error retrieving full article: {str(e)}")
+        return []
 
 
 def get_general_terms(client, query_date: datetime) -> List[Dict]:
@@ -84,7 +123,6 @@ def get_general_terms(client, query_date: datetime) -> List[Dict]:
     try:
         collection = client.collections.get("Vmi_docs")
 
-        # Create filter for general terms articles
         filter_general = wvc.query.Filter.by_property("article_number").contains_any(["1", "2"])
         filter_date = (
                 wvc.query.Filter.by_property("valid_from").less_or_equal(query_date.strftime('%Y-%m-%dT%H:%M:%SZ')) &
@@ -92,22 +130,13 @@ def get_general_terms(client, query_date: datetime) -> List[Dict]:
         )
         combined_filter = filter_general & filter_date
 
-        # Execute query
         query_result = collection.query.fetch_objects(
-            return_properties =  ["article_number", "article_content", "valid_from", "valid_to"],
+            return_properties=["article_number", "article_content", "article_title", "valid_from", "valid_to", "name",
+                               "doc_link"],
             filters=combined_filter,
         )
-        objects = query_result.objects
-        batch_data = [
-            {
-                **{k: str(v) if hasattr(v, '__str__') and not isinstance(v,
-                                                                         (str, int, float, bool, list, dict)) else v
-                   for k, v in obj.properties.items()}
-            }
-            for obj in objects
-        ]
-        # st.write(batch_data)
-        return batch_data
+
+        return [obj.properties for obj in query_result.objects]
 
     except Exception as e:
         print(f"Error retrieving general terms: {str(e)}")
@@ -119,13 +148,11 @@ def perform_hybrid_search(client, query: str, query_date: datetime, limit: int =
     try:
         collection = client.collections.get("Vmi_docs")
 
-        # Create date filter
         filter_date = (
                 wvc.query.Filter.by_property("valid_from").less_or_equal(query_date.strftime('%Y-%m-%dT%H:%M:%SZ')) &
                 wvc.query.Filter.by_property("valid_to").greater_or_equal(query_date.strftime('%Y-%m-%dT%H:%M:%SZ'))
         )
 
-        # Execute hybrid search
         response = collection.query.hybrid(
             query=query,
             filters=filter_date,
@@ -137,20 +164,42 @@ def perform_hybrid_search(client, query: str, query_date: datetime, limit: int =
             limit=limit
         )
 
-        results = []
+        # Get full articles for each result
+        full_results = []
+        # print(response.objects)
         for obj in response.objects:
-            result = {
-                "properties": obj.properties,
-                "score": obj.metadata.score,
-                "explain_score": obj.metadata.explain_score
-            }
-            results.append(result)
+            properties = obj.properties
+            print({properties.get('article_number'),
+                   })
+            full_article = get_full_article(
+                client,
+                properties.get('article_number'),
+                properties.get('valid_from'),
+                properties.get('valid_to')
+            )
+            if full_article:
+                full_results += full_article
 
-        return results
+        return full_results
 
     except Exception as e:
         print(f"Error in hybrid search: {str(e)}")
         return []
+
+
+def display_document_card(doc: Dict):
+    """Display a document card with article information"""
+    with st.container():
+        st.markdown(f"""
+        <div style='border: 1px solid #ddd; padding: 1rem; margin: 1rem 0; border-radius: 5px;'>
+            <h4>{doc.get('article_title', '')}</h4>
+            <p><strong>Straipsnis {doc.get('article_number', '')}: {doc.get('article_title', '')}</strong></p>
+            <p><em>{doc.get('chapter_title', '')}</em></p>
+            <p><small>Galioja nuo: {doc.get('valid_from', '').strftime('%Y-%m-%d')} iki {doc.get('valid_to', '').strftime('%Y-%m-%d')}</small></p>
+            <a href="{doc.get('doc_link', '#')}" target="_blank">Originalus dokumentas →</a>
+        </div>
+        """, unsafe_allow_html=True)
+
 
 
 def evaluate_legal_documents(query: str, general_terms: List[Dict], search_results: List[Dict], llm: ChatOpenAI) -> str:
@@ -165,10 +214,9 @@ def evaluate_legal_documents(query: str, general_terms: List[Dict], search_resul
     ])
 
     docs_list += "\n\nRelevant Articles:\n" + "\n\n".join([
-        f"Article {result['properties'].get('article_number', '')}\n"
-        f"Valid from: {result['properties'].get('valid_from', '')}\n"
-        f"{result['properties'].get('article_content', '')}\n"
-        f"Relevance score: {result.get('score', 0)}"
+        f"Article {result.get('article_number', '')}\n"
+        f"Valid from: {result.get('valid_from', '')}\n"
+        f"{result.get('article_content', '')}\n"
         for result in search_results
     ])
 
@@ -185,15 +233,13 @@ def evaluate_legal_documents(query: str, general_terms: List[Dict], search_resul
     1. Cites relevant articles directly
     2. Explains how they answer the query
     3. Notes any missing information
-    4. Mentions time period relevance
 
-    Keep answers factual and based solely on the provided documents. Answer in Lithuanian language.
+    Keep answers factual and based solely on the provided documents. Answer must be provided in Lithuanian language.
     """
 
     try:
         structured_llm = llm.with_structured_output(LegalDocumentEvaluation)
         evaluation = structured_llm.invoke(evaluation_prompt)
-
         # Format response
         response = "📋 Atsakymas į jūsų užklausą:\n\n"
 
@@ -217,26 +263,15 @@ def evaluate_legal_documents(query: str, general_terms: List[Dict], search_resul
         return "Atsiprašome, įvyko klaida vertinant dokumentus. Bandykite dar kartą."
 
 
-def process_legal_query(prompt: str, client, llm: ChatOpenAI) -> Tuple[str, List[Dict]]:
+def process_legal_query(prompt: str, client, llm: ChatOpenAI):
     """Process legal query and return relevant documents"""
-
-    # Step 1: Extract relevant date from query
-    st.write(prompt)
-    query_date = extract_date_from_query(prompt, llm)
-    st.write(f"Query date: {query_date}")
-
-    # Step 2: Get general terms
+    query_date = st.session_state.query_date
     general_terms = get_general_terms(client, query_date)
-    st.write(f"Found {len(general_terms)} general terms articles")
 
-    # Step 3: Perform hybrid search
     search_results = perform_hybrid_search(client, prompt, query_date)
-    print(f"Found {len(search_results)} relevant articles")
 
-    # Step 4: Evaluate and format results
     response = evaluate_legal_documents(prompt, general_terms, search_results, llm)
-
-    return response, search_results
+    return response, search_results, general_terms
 
 
 def main():
@@ -247,10 +282,18 @@ def main():
     try:
         client = setup_weaviate_client()
         llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
-
     except Exception as e:
         st.error("Klaida jungiantis prie dokumentų duomenų bazės")
         return
+
+    # Date selector in sidebar
+    with st.sidebar:
+        st.write("### Datos nustatymai")
+        selected_date = st.date_input(
+            "Pasirinkite datą dokumentų paieškai",
+            value=st.session_state.query_date
+        )
+        st.session_state.query_date = datetime.combine(selected_date, datetime.min.time())
 
     # Display chat history
     for message in st.session_state.messages:
@@ -258,35 +301,46 @@ def main():
             st.markdown(message["content"])
 
     if prompt := st.chat_input("Užduokite klausimą apie teisinį reguliavimą..."):
-        # Add user message to chat
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Process query and display results
         with st.chat_message("assistant"):
             try:
                 with st.spinner("Ieškau tinkamų dokumentų..."):
-                    response, search_results = process_legal_query(prompt, client, llm)
-
-                    # Add response to chat history
+                    response, search_results, general_terms = process_legal_query(prompt, client, llm)
                     st.session_state.messages.append({"role": "assistant", "content": response})
                     st.markdown(response)
 
-                    # Display debug information in sidebar if needed
-                    with st.sidebar:
-                        if st.checkbox("Rodyti detalią informaciją"):
-                            st.json([{
-                                "article_number": r['properties'].get('article_number'),
-                                "valid_from": r['properties'].get('valid_from'),
-                                "score": r['score']
-                            } for r in search_results])
+                    docs = []
+                    for doc in general_terms:
+                        docs.append({"article_number": doc.get('article_number', ''),
+                                     "article_title": doc.get('article_title', ''),
+                                     "doc_link": doc.get('doc_link', ''),
+                                     "valid_from": doc.get('valid_from', ''),
+                                     "valid_to": doc.get('valid_to', '')})
+
+                    for doc in search_results:
+                        docs.append({"article_number": doc.get('article_number', ''),
+                                     "article_title": doc.get('article_title', ''),
+                                     "doc_link": doc.get('doc_link', ''),
+                                     "valid_from": doc.get('valid_from', ''),
+                                     "valid_to": doc.get('valid_to', '')})
+
+                    df = pd.DataFrame(docs).drop_duplicates()
+                    unique_articles = df.to_dict('records')
+
+                    # Display document cards
+                    st.write("### 📚 Bendrosios nuostatos ir Aktualūs straipsniai")
+                    # st.write(general_terms)
+                    for doc in unique_articles:
+                        display_document_card(doc)
+
 
             except Exception as e:
                 st.error("Įvyko klaida apdorojant užklausą")
-                print(f"Error: {str(e)}")
+                st.error(f"Error: {str(e)}")
 
-    # Clear chat button
     with st.sidebar:
         if st.button("Išvalyti pokalbį"):
             st.session_state.messages = []

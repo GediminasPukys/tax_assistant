@@ -283,7 +283,7 @@ def main():
 
     try:
         client = setup_weaviate_client()
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.1, api_key=openai_api_key)
+        llm = ChatOpenAI(model="gpt-4o", temperature=0.7, api_key=openai_api_key)
     except Exception as e:
         st.error("Klaida jungiantis prie dokumentų duomenų bazės")
         return
